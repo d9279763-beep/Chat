@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   View,
   Text,
@@ -15,7 +15,7 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
-import * as Speech from 'expo-speech';
+import { Audio } from 'expo-av';
 import { useRouter } from 'expo-router';
 
 const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL;
@@ -27,6 +27,8 @@ interface Message {
   timestamp: Date;
   searchedWeb?: boolean;
   learnedInfo?: { key: string; value: string } | null;
+  knowledgeUsed?: number;
+  audioBase64?: string;
 }
 
 export default function JarvisScreen() {
@@ -38,7 +40,9 @@ export default function JarvisScreen() {
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [searchEnabled, setSearchEnabled] = useState(false);
+  const [voiceEnabled, setVoiceEnabled] = useState(true);
   const [transcript, setTranscript] = useState('');
+  const [currentSound, setCurrentSound] = useState<Audio.Sound | null>(null);
   const scrollViewRef = useRef<ScrollView>(null);
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const glowAnim = useRef(new Animated.Value(0.3)).current;
@@ -49,13 +53,16 @@ export default function JarvisScreen() {
     const greeting: Message = {
       id: '1',
       role: 'jarvis',
-      content: "Good day, Sir. I am JARVIS, your personal AI assistant. I'm at your service and ready to assist with whatever you require. How may I be of help today?",
+      content: "Good day, Sir. I am JARVIS, your personal AI assistant. I continuously learn from our conversations and grow smarter every day. How may I be of service?",
       timestamp: new Date(),
     };
     setMessages([greeting]);
     
-    // Speak greeting with British voice
-    speakResponse(greeting.content);
+    // Play greeting with HD voice
+    playHighQualityVoice(greeting.content);
+    
+    // Setup audio
+    setupAudio();
     
     // Start glow animation
     Animated.loop(
@@ -72,7 +79,25 @@ export default function JarvisScreen() {
         }),
       ])
     ).start();
+    
+    return () => {
+      if (currentSound) {
+        currentSound.unloadAsync();
+      }
+    };
   }, []);
+
+  const setupAudio = async () => {
+    try {
+      await Audio.setAudioModeAsync({
+        playsInSilentModeIOS: true,
+        staysActiveInBackground: false,
+        shouldDuckAndroid: true,
+      });
+    } catch (error) {
+      console.error('Audio setup error:', error);
+    }
+  };
 
   // Pulse animation when loading
   useEffect(() => {
@@ -96,7 +121,7 @@ export default function JarvisScreen() {
     }
   }, [isLoading]);
 
-  // Mic pulse animation when listening
+  // Mic pulse animation
   useEffect(() => {
     if (isListening) {
       Animated.loop(
@@ -118,45 +143,81 @@ export default function JarvisScreen() {
     }
   }, [isListening]);
 
-  const speakResponse = async (text: string) => {
+  const playHighQualityVoice = async (text: string, audioBase64?: string) => {
+    if (!voiceEnabled) return;
+    
     try {
       setIsSpeaking(true);
       
-      // Get available voices and find a British one
-      const voices = await Speech.getAvailableVoicesAsync();
+      // Stop any currently playing sound
+      if (currentSound) {
+        await currentSound.stopAsync();
+        await currentSound.unloadAsync();
+      }
       
-      // Try to find British English voices
-      const britishVoices = voices.filter(v => 
-        v.language?.includes('en-GB') || 
-        v.identifier?.includes('en-GB') ||
-        v.name?.toLowerCase().includes('british') ||
-        v.name?.toLowerCase().includes('daniel') ||
-        v.name?.toLowerCase().includes('arthur') ||
-        v.name?.toLowerCase().includes('oliver')
-      );
+      let base64Audio = audioBase64;
       
-      const voiceToUse = britishVoices[0]?.identifier || undefined;
+      // If no audio provided, fetch from TTS endpoint
+      if (!base64Audio) {
+        try {
+          const response = await fetch(`${BACKEND_URL}/api/tts`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+              text: text.substring(0, 4000),  // TTS limit
+              voice: 'onyx'  // Deep, authoritative British-like voice
+            }),
+          });
+          
+          if (response.ok) {
+            const data = await response.json();
+            base64Audio = data.audio_base64;
+          }
+        } catch (e) {
+          console.log('TTS fetch failed, falling back to no voice');
+          setIsSpeaking(false);
+          return;
+        }
+      }
       
-      await Speech.speak(text, {
-        language: 'en-GB',
-        voice: voiceToUse,
-        pitch: 1.0,
-        rate: Platform.OS === 'ios' ? 0.52 : 0.9,
-        onDone: () => setIsSpeaking(false),
-        onError: () => setIsSpeaking(false),
-      });
+      if (base64Audio) {
+        // Play the audio
+        const { sound } = await Audio.Sound.createAsync(
+          { uri: `data:audio/mp3;base64,${base64Audio}` },
+          { shouldPlay: true }
+        );
+        
+        setCurrentSound(sound);
+        
+        sound.setOnPlaybackStatusUpdate((status) => {
+          if (status.isLoaded && status.didJustFinish) {
+            setIsSpeaking(false);
+            sound.unloadAsync();
+          }
+        });
+      } else {
+        setIsSpeaking(false);
+      }
     } catch (error) {
-      console.error('Speech error:', error);
+      console.error('Voice playback error:', error);
       setIsSpeaking(false);
     }
   };
 
   const stopSpeaking = async () => {
-    await Speech.stop();
-    setIsSpeaking(false);
+    try {
+      if (currentSound) {
+        await currentSound.stopAsync();
+        await currentSound.unloadAsync();
+        setCurrentSound(null);
+      }
+      setIsSpeaking(false);
+    } catch (error) {
+      console.error('Stop speaking error:', error);
+    }
   };
 
-  // Voice recognition using Web Speech API (works on web)
+  // Voice recognition using Web Speech API
   const startListening = async () => {
     if (Platform.OS === 'web') {
       try {
@@ -169,24 +230,28 @@ export default function JarvisScreen() {
         const recognition = new SpeechRecognition();
         recognition.lang = 'en-US';
         recognition.interimResults = true;
-        recognition.continuous = false;
+        recognition.continuous = true;
         
         setIsListening(true);
         setTranscript('');
         
         recognition.onresult = (event: any) => {
-          const current = event.resultIndex;
-          const result = event.results[current];
-          const transcriptText = result[0].transcript;
-          setTranscript(transcriptText);
+          let finalTranscript = '';
+          let interimTranscript = '';
           
-          if (result.isFinal) {
-            setInputText(transcriptText);
-            setIsListening(false);
-            // Auto-send after voice input
-            setTimeout(() => {
-              sendMessage(transcriptText);
-            }, 500);
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            const result = event.results[i];
+            if (result.isFinal) {
+              finalTranscript += result[0].transcript;
+            } else {
+              interimTranscript += result[0].transcript;
+            }
+          }
+          
+          setTranscript(finalTranscript || interimTranscript);
+          
+          if (finalTranscript) {
+            setInputText(prev => prev + ' ' + finalTranscript);
           }
         };
         
@@ -199,12 +264,10 @@ export default function JarvisScreen() {
         };
         
         recognition.onend = () => {
-          setIsListening(false);
+          // Don't auto-stop, let user control
         };
         
         recognition.start();
-        
-        // Store recognition instance for stopping
         (window as any).currentRecognition = recognition;
         
       } catch (error) {
@@ -213,10 +276,9 @@ export default function JarvisScreen() {
         Alert.alert('Error', 'Failed to start voice recognition. Please try again.');
       }
     } else {
-      // For native platforms, show info about voice input
       Alert.alert(
         'Voice Input',
-        'Voice recognition is available on web preview. On mobile devices, use the Expo Go app with a compatible device.',
+        'Voice recognition works best on web. On mobile, use the Expo Go app.',
         [{ text: 'OK' }]
       );
     }
@@ -227,6 +289,11 @@ export default function JarvisScreen() {
       (window as any).currentRecognition.stop();
     }
     setIsListening(false);
+    
+    // Auto-send if we have text
+    if (inputText.trim()) {
+      setTimeout(() => sendMessage(inputText), 300);
+    }
   };
 
   const sendMessage = async (text: string) => {
@@ -235,7 +302,7 @@ export default function JarvisScreen() {
     const userMessage: Message = {
       id: Date.now().toString(),
       role: 'user',
-      content: text,
+      content: text.trim(),
       timestamp: new Date(),
     };
 
@@ -248,13 +315,12 @@ export default function JarvisScreen() {
     try {
       const response = await fetch(`${BACKEND_URL}/api/chat`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          message: text,
+          message: text.trim(),
           session_id: sessionId,
           enable_search: searchEnabled,
+          enable_voice: voiceEnabled,
         }),
       });
 
@@ -275,22 +341,30 @@ export default function JarvisScreen() {
         timestamp: new Date(data.timestamp),
         searchedWeb: data.searched_web,
         learnedInfo: data.learned_info,
+        knowledgeUsed: data.knowledge_used,
+        audioBase64: data.audio_base64,
       };
 
       setMessages(prev => [...prev, jarvisMessage]);
       
-      // Speak the response with British voice
-      speakResponse(data.response);
+      // Play high-quality voice response
+      if (data.audio_base64) {
+        playHighQualityVoice(data.response, data.audio_base64);
+      } else if (voiceEnabled) {
+        playHighQualityVoice(data.response);
+      }
     } catch (error) {
       console.error('Error:', error);
       const errorMessage: Message = {
         id: (Date.now() + 1).toString(),
         role: 'jarvis',
-        content: "I do apologise, Sir, but I'm experiencing some technical difficulties at the moment. Might I suggest trying again shortly?",
+        content: "I do apologise, Sir, but I'm experiencing some technical difficulties. Might I suggest trying again shortly?",
         timestamp: new Date(),
       };
       setMessages(prev => [...prev, errorMessage]);
-      speakResponse(errorMessage.content);
+      if (voiceEnabled) {
+        playHighQualityVoice(errorMessage.content);
+      }
     } finally {
       setIsLoading(false);
     }
@@ -309,7 +383,9 @@ export default function JarvisScreen() {
       };
       
       setMessages(prev => [...prev, jarvisMessage]);
-      speakResponse(data.jarvis_response);
+      if (voiceEnabled) {
+        playHighQualityVoice(data.jarvis_response);
+      }
     } catch (error) {
       console.error('Time error:', error);
     }
@@ -337,7 +413,7 @@ export default function JarvisScreen() {
           </Animated.View>
           <View style={styles.headerText}>
             <Text style={styles.title}>J.A.R.V.I.S</Text>
-            <Text style={styles.subtitle}>Just A Rather Very Intelligent System</Text>
+            <Text style={styles.subtitle}>Evolving AI Assistant</Text>
           </View>
           <TouchableOpacity 
             style={styles.settingsButton} 
@@ -350,18 +426,25 @@ export default function JarvisScreen() {
           <View style={styles.statusIndicator}>
             <View style={[styles.statusDot, isLoading && styles.statusDotActive, isListening && styles.statusDotListening]} />
             <Text style={styles.statusText}>
-              {isListening ? 'Listening...' : isLoading ? 'Processing...' : 'Online'}
+              {isListening ? 'Listening...' : isLoading ? 'Thinking...' : 'Online'}
             </Text>
           </View>
-          <TouchableOpacity 
-            style={[styles.searchToggle, searchEnabled && styles.searchToggleActive]}
-            onPress={() => setSearchEnabled(!searchEnabled)}
-          >
-            <Ionicons name="globe-outline" size={16} color={searchEnabled ? '#00ff88' : '#666'} />
-            <Text style={[styles.searchToggleText, searchEnabled && styles.searchToggleTextActive]}>
-              Web Search
-            </Text>
-          </TouchableOpacity>
+          <View style={styles.toggleRow}>
+            <TouchableOpacity 
+              style={[styles.toggle, searchEnabled && styles.toggleActive]}
+              onPress={() => setSearchEnabled(!searchEnabled)}
+            >
+              <Ionicons name="globe-outline" size={14} color={searchEnabled ? '#00ff88' : '#666'} />
+              <Text style={[styles.toggleText, searchEnabled && styles.toggleTextActive]}>Web</Text>
+            </TouchableOpacity>
+            <TouchableOpacity 
+              style={[styles.toggle, voiceEnabled && styles.toggleActive]}
+              onPress={() => setVoiceEnabled(!voiceEnabled)}
+            >
+              <Ionicons name="volume-high-outline" size={14} color={voiceEnabled ? '#00ff88' : '#666'} />
+              <Text style={[styles.toggleText, voiceEnabled && styles.toggleTextActive]}>Voice</Text>
+            </TouchableOpacity>
+          </View>
         </View>
       </View>
 
@@ -400,20 +483,26 @@ export default function JarvisScreen() {
                 ]}>
                   {message.content}
                 </Text>
-                {message.searchedWeb && (
-                  <View style={styles.searchBadge}>
-                    <Ionicons name="globe-outline" size={12} color="#00ff88" />
-                    <Text style={styles.searchBadgeText}>Web search used</Text>
-                  </View>
-                )}
-                {message.learnedInfo && (
-                  <View style={styles.learnedBadge}>
-                    <Ionicons name="bulb-outline" size={12} color="#ffaa00" />
-                    <Text style={styles.learnedBadgeText}>
-                      Learned: {message.learnedInfo.key}
-                    </Text>
-                  </View>
-                )}
+                <View style={styles.badgeRow}>
+                  {message.searchedWeb && (
+                    <View style={styles.badge}>
+                      <Ionicons name="globe-outline" size={10} color="#00ff88" />
+                      <Text style={styles.badgeText}>Web</Text>
+                    </View>
+                  )}
+                  {message.knowledgeUsed && message.knowledgeUsed > 0 && (
+                    <View style={[styles.badge, styles.knowledgeBadge]}>
+                      <Ionicons name="library-outline" size={10} color="#00d4ff" />
+                      <Text style={[styles.badgeText, { color: '#00d4ff' }]}>{message.knowledgeUsed} knowledge</Text>
+                    </View>
+                  )}
+                  {message.learnedInfo && (
+                    <View style={[styles.badge, styles.learnedBadge]}>
+                      <Ionicons name="bulb-outline" size={10} color="#ffaa00" />
+                      <Text style={[styles.badgeText, { color: '#ffaa00' }]}>Learned</Text>
+                    </View>
+                  )}
+                </View>
               </View>
             </View>
           ))}
@@ -426,42 +515,49 @@ export default function JarvisScreen() {
                 </Animated.View>
               </View>
               <View style={[styles.messageContent, styles.jarvisContent]}>
-                <ActivityIndicator size="small" color="#00d4ff" />
+                <View style={styles.thinkingContainer}>
+                  <ActivityIndicator size="small" color="#00d4ff" />
+                  <Text style={styles.thinkingText}>Processing...</Text>
+                </View>
               </View>
             </View>
           )}
         </ScrollView>
 
         {/* Voice Transcript Display */}
-        {isListening && transcript && (
+        {isListening && (
           <View style={styles.transcriptContainer}>
-            <Text style={styles.transcriptText}>{transcript}</Text>
+            <View style={styles.listeningIndicator}>
+              <Animated.View style={{ transform: [{ scale: micPulse }] }}>
+                <Ionicons name="mic" size={20} color="#ff4444" />
+              </Animated.View>
+              <Text style={styles.listeningText}>Listening...</Text>
+            </View>
+            {transcript && <Text style={styles.transcriptText}>{transcript}</Text>}
           </View>
         )}
 
         {/* Quick Actions */}
         <View style={styles.quickActions}>
           <TouchableOpacity style={styles.quickButton} onPress={getQuickTime}>
-            <Ionicons name="time-outline" size={18} color="#00d4ff" />
+            <Ionicons name="time-outline" size={16} color="#00d4ff" />
             <Text style={styles.quickButtonText}>Time</Text>
           </TouchableOpacity>
-          <TouchableOpacity 
-            style={styles.quickButton} 
-            onPress={() => sendMessage("What can you do?")}
-          >
-            <Ionicons name="help-circle-outline" size={18} color="#00d4ff" />
+          <TouchableOpacity style={styles.quickButton} onPress={() => sendMessage("What can you do?")}>
+            <Ionicons name="help-circle-outline" size={16} color="#00d4ff" />
             <Text style={styles.quickButtonText}>Help</Text>
           </TouchableOpacity>
-          <TouchableOpacity 
-            style={styles.quickButton} 
-            onPress={() => sendMessage("Search for the latest news")}
-          >
-            <Ionicons name="newspaper-outline" size={18} color="#00d4ff" />
+          <TouchableOpacity style={styles.quickButton} onPress={() => sendMessage("Search for the latest tech news")}>
+            <Ionicons name="newspaper-outline" size={16} color="#00d4ff" />
             <Text style={styles.quickButtonText}>News</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.quickButton} onPress={() => router.push('/settings')}>
+            <Ionicons name="analytics-outline" size={16} color="#00d4ff" />
+            <Text style={styles.quickButtonText}>Stats</Text>
           </TouchableOpacity>
           {isSpeaking && (
             <TouchableOpacity style={[styles.quickButton, styles.stopButton]} onPress={stopSpeaking}>
-              <Ionicons name="volume-mute" size={18} color="#ff4444" />
+              <Ionicons name="stop" size={16} color="#ff4444" />
               <Text style={[styles.quickButtonText, { color: '#ff4444' }]}>Stop</Text>
             </TouchableOpacity>
           )}
@@ -470,70 +566,38 @@ export default function JarvisScreen() {
         {/* Input Area */}
         <View style={styles.inputContainer}>
           <View style={styles.inputWrapper}>
-            {/* Voice Button */}
-            <TouchableOpacity
-              style={[
-                styles.voiceButton,
-                isListening && styles.voiceButtonActive,
-              ]}
-              onPress={isListening ? stopListening : startListening}
-              disabled={isLoading}
-            >
-              <Animated.View style={isListening ? { transform: [{ scale: micPulse }] } : {}}>
-                <Ionicons
-                  name={isListening ? "mic" : "mic-outline"}
-                  size={24}
-                  color={isListening ? '#ff4444' : '#00d4ff'}
-                />
-              </Animated.View>
-            </TouchableOpacity>
-            
             <TextInput
               style={styles.input}
-              value={isListening ? transcript : inputText}
+              value={inputText}
               onChangeText={setInputText}
-              placeholder={isListening ? "Listening..." : "Speak to JARVIS..."}
+              placeholder="Speak to JARVIS..."
               placeholderTextColor="#666"
               multiline
               maxLength={1000}
-              editable={!isLoading && !isListening}
+              editable={!isLoading}
             />
             <TouchableOpacity
-              style={[
-                styles.sendButton,
-                (!inputText.trim() || isLoading) && styles.sendButtonDisabled,
-              ]}
+              style={[styles.sendButton, (!inputText.trim() || isLoading) && styles.sendButtonDisabled]}
               onPress={() => sendMessage(inputText)}
               disabled={!inputText.trim() || isLoading}
             >
-              <Ionicons
-                name="send"
-                size={20}
-                color={inputText.trim() && !isLoading ? '#00d4ff' : '#444'}
-              />
+              <Ionicons name="send" size={20} color={inputText.trim() && !isLoading ? '#00d4ff' : '#444'} />
             </TouchableOpacity>
           </View>
           
           {/* Live Conversation Button */}
           <TouchableOpacity
-            style={[
-              styles.liveConversationButton,
-              isListening && styles.liveConversationButtonActive,
-            ]}
+            style={[styles.liveConversationButton, isListening && styles.liveConversationButtonActive]}
             onPress={isListening ? stopListening : startListening}
             disabled={isLoading}
           >
             <Animated.View style={isListening ? { transform: [{ scale: micPulse }] } : {}}>
               <View style={[styles.liveButtonInner, isListening && styles.liveButtonInnerActive]}>
-                <Ionicons
-                  name={isListening ? "stop" : "mic"}
-                  size={28}
-                  color={isListening ? '#fff' : '#00d4ff'}
-                />
+                <Ionicons name={isListening ? "stop" : "mic"} size={28} color={isListening ? '#fff' : '#00d4ff'} />
               </View>
             </Animated.View>
             <Text style={[styles.liveButtonText, isListening && styles.liveButtonTextActive]}>
-              {isListening ? 'Tap to Stop' : 'Hold to Speak'}
+              {isListening ? 'Tap to Send' : 'Tap to Speak'}
             </Text>
           </TouchableOpacity>
         </View>
@@ -548,8 +612,8 @@ const styles = StyleSheet.create({
     backgroundColor: '#0a0a0f',
   },
   header: {
-    paddingHorizontal: 20,
-    paddingVertical: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
     borderBottomWidth: 1,
     borderBottomColor: '#1a1a2e',
   },
@@ -558,12 +622,12 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   jarvisIcon: {
-    marginRight: 12,
+    marginRight: 10,
   },
   arcReactor: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
     backgroundColor: '#001a2e',
     borderWidth: 2,
     borderColor: '#00d4ff',
@@ -571,9 +635,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   arcReactorInner: {
-    width: 20,
-    height: 20,
-    borderRadius: 10,
+    width: 18,
+    height: 18,
+    borderRadius: 9,
     backgroundColor: '#00d4ff',
   },
   headerText: {
@@ -583,7 +647,7 @@ const styles = StyleSheet.create({
     padding: 8,
   },
   title: {
-    fontSize: 24,
+    fontSize: 22,
     fontWeight: 'bold',
     color: '#00d4ff',
     letterSpacing: 2,
@@ -592,7 +656,6 @@ const styles = StyleSheet.create({
     fontSize: 10,
     color: '#4a9eff',
     letterSpacing: 1,
-    marginTop: 2,
   },
   statusRow: {
     flexDirection: 'row',
@@ -609,7 +672,7 @@ const styles = StyleSheet.create({
     height: 8,
     borderRadius: 4,
     backgroundColor: '#00ff88',
-    marginRight: 8,
+    marginRight: 6,
   },
   statusDotActive: {
     backgroundColor: '#ffaa00',
@@ -618,28 +681,32 @@ const styles = StyleSheet.create({
     backgroundColor: '#ff4444',
   },
   statusText: {
-    fontSize: 12,
+    fontSize: 11,
     color: '#666',
   },
-  searchToggle: {
+  toggleRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  toggle: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 10,
+    paddingHorizontal: 8,
     paddingVertical: 4,
-    borderRadius: 12,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: '#333',
     gap: 4,
   },
-  searchToggleActive: {
+  toggleActive: {
     borderColor: '#00ff88',
     backgroundColor: 'rgba(0, 255, 136, 0.1)',
   },
-  searchToggleText: {
-    fontSize: 11,
+  toggleText: {
+    fontSize: 10,
     color: '#666',
   },
-  searchToggleTextActive: {
+  toggleTextActive: {
     color: '#00ff88',
   },
   messagesContainer: {
@@ -649,12 +716,12 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   messagesContent: {
-    padding: 16,
+    padding: 12,
     paddingBottom: 8,
   },
   messageBubble: {
     flexDirection: 'row',
-    marginBottom: 12,
+    marginBottom: 10,
     alignItems: 'flex-start',
   },
   userBubble: {
@@ -664,9 +731,9 @@ const styles = StyleSheet.create({
     justifyContent: 'flex-start',
   },
   jarvisAvatar: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
+    width: 26,
+    height: 26,
+    borderRadius: 13,
     backgroundColor: '#0d1b2a',
     borderWidth: 1,
     borderColor: '#00d4ff',
@@ -676,8 +743,8 @@ const styles = StyleSheet.create({
   },
   messageContent: {
     maxWidth: '80%',
-    borderRadius: 16,
-    paddingHorizontal: 14,
+    borderRadius: 14,
+    paddingHorizontal: 12,
     paddingVertical: 10,
   },
   userContent: {
@@ -692,8 +759,8 @@ const styles = StyleSheet.create({
     borderBottomLeftRadius: 4,
   },
   messageText: {
-    fontSize: 15,
-    lineHeight: 22,
+    fontSize: 14,
+    lineHeight: 20,
   },
   userText: {
     color: '#e0e0e0',
@@ -701,68 +768,94 @@ const styles = StyleSheet.create({
   jarvisText: {
     color: '#b0d4ff',
   },
-  searchBadge: {
+  badgeRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    marginTop: 6,
+    gap: 6,
+  },
+  badge: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginTop: 8,
-    gap: 4,
+    backgroundColor: 'rgba(0, 255, 136, 0.1)',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 8,
+    gap: 3,
   },
-  searchBadgeText: {
-    fontSize: 10,
-    color: '#00ff88',
+  knowledgeBadge: {
+    backgroundColor: 'rgba(0, 212, 255, 0.1)',
   },
   learnedBadge: {
+    backgroundColor: 'rgba(255, 170, 0, 0.1)',
+  },
+  badgeText: {
+    fontSize: 9,
+    color: '#00ff88',
+  },
+  thinkingContainer: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginTop: 4,
-    gap: 4,
+    gap: 8,
   },
-  learnedBadgeText: {
-    fontSize: 10,
-    color: '#ffaa00',
+  thinkingText: {
+    fontSize: 12,
+    color: '#00d4ff',
+    fontStyle: 'italic',
   },
   transcriptContainer: {
     backgroundColor: 'rgba(255, 68, 68, 0.1)',
-    padding: 12,
-    marginHorizontal: 16,
-    borderRadius: 8,
+    padding: 10,
+    marginHorizontal: 12,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: '#ff4444',
+  },
+  listeningIndicator: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 6,
+  },
+  listeningText: {
+    color: '#ff4444',
+    fontSize: 12,
+    fontWeight: '600',
   },
   transcriptText: {
     color: '#ff8888',
     fontSize: 14,
-    fontStyle: 'italic',
   },
   quickActions: {
     flexDirection: 'row',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    gap: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    gap: 6,
     flexWrap: 'wrap',
   },
   quickButton: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
     backgroundColor: '#0d1b2a',
-    borderRadius: 20,
+    borderRadius: 16,
     borderWidth: 1,
     borderColor: '#1a3a5c',
-    gap: 6,
+    gap: 4,
   },
   stopButton: {
     borderColor: '#ff4444',
+    backgroundColor: 'rgba(255, 68, 68, 0.1)',
   },
   quickButtonText: {
     color: '#00d4ff',
-    fontSize: 13,
+    fontSize: 11,
     fontWeight: '500',
   },
   inputContainer: {
-    padding: 16,
-    paddingTop: 8,
+    padding: 12,
+    paddingTop: 6,
     borderTopWidth: 1,
     borderTopColor: '#1a1a2e',
   },
@@ -770,38 +863,23 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'flex-end',
     backgroundColor: '#0d1b2a',
-    borderRadius: 24,
+    borderRadius: 20,
     borderWidth: 1,
     borderColor: '#1a3a5c',
-    paddingHorizontal: 8,
-    paddingVertical: 8,
-  },
-  voiceButton: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: '#1a3a5c',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginRight: 8,
-  },
-  voiceButtonActive: {
-    backgroundColor: 'rgba(255, 68, 68, 0.2)',
-    borderWidth: 1,
-    borderColor: '#ff4444',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
   },
   input: {
     flex: 1,
     color: '#fff',
-    fontSize: 16,
-    maxHeight: 100,
+    fontSize: 15,
+    maxHeight: 80,
     paddingVertical: 8,
-    paddingHorizontal: 8,
   },
   sendButton: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
     backgroundColor: '#1a3a5c',
     justifyContent: 'center',
     alignItems: 'center',
@@ -814,22 +892,22 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    marginTop: 12,
-    paddingVertical: 12,
+    marginTop: 10,
+    paddingVertical: 10,
     backgroundColor: '#0d1b2a',
-    borderRadius: 30,
+    borderRadius: 25,
     borderWidth: 2,
     borderColor: '#1a3a5c',
-    gap: 12,
+    gap: 10,
   },
   liveConversationButtonActive: {
     borderColor: '#ff4444',
     backgroundColor: 'rgba(255, 68, 68, 0.1)',
   },
   liveButtonInner: {
-    width: 50,
-    height: 50,
-    borderRadius: 25,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
     backgroundColor: '#1a3a5c',
     justifyContent: 'center',
     alignItems: 'center',
@@ -842,7 +920,7 @@ const styles = StyleSheet.create({
   },
   liveButtonText: {
     color: '#00d4ff',
-    fontSize: 16,
+    fontSize: 14,
     fontWeight: '600',
   },
   liveButtonTextActive: {

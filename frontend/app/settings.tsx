@@ -38,11 +38,20 @@ interface HabitStats {
   action_breakdown: Record<string, number>;
 }
 
+interface TrainingStats {
+  total_conversations: number;
+  total_knowledge_entries: number;
+  total_memories: number;
+  most_discussed_topics: Record<string, number>;
+  learning_rate: number;
+}
+
 export default function SettingsScreen() {
   const router = useRouter();
   const [commands, setCommands] = useState<CustomCommand[]>([]);
   const [memories, setMemories] = useState<Memory[]>([]);
   const [habitStats, setHabitStats] = useState<HabitStats | null>(null);
+  const [trainingStats, setTrainingStats] = useState<TrainingStats | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [showCommandModal, setShowCommandModal] = useState(false);
   const [showMemoryModal, setShowMemoryModal] = useState(false);
@@ -56,15 +65,17 @@ export default function SettingsScreen() {
   const loadData = async () => {
     setIsLoading(true);
     try {
-      const [commandsRes, memoriesRes, habitsRes] = await Promise.all([
+      const [commandsRes, memoriesRes, habitsRes, trainingRes] = await Promise.all([
         fetch(`${BACKEND_URL}/api/commands`),
         fetch(`${BACKEND_URL}/api/memory`),
         fetch(`${BACKEND_URL}/api/habits/stats`),
+        fetch(`${BACKEND_URL}/api/training/stats`),
       ]);
 
       if (commandsRes.ok) setCommands(await commandsRes.json());
       if (memoriesRes.ok) setMemories(await memoriesRes.json());
       if (habitsRes.ok) setHabitStats(await habitsRes.json());
+      if (trainingRes.ok) setTrainingStats(await trainingRes.json());
     } catch (error) {
       console.error('Error loading data:', error);
     } finally {
@@ -180,7 +191,35 @@ export default function SettingsScreen() {
       </View>
 
       <ScrollView style={styles.content} showsVerticalScrollIndicator={false}>
-        {/* Habit Statistics */}
+        {/* Training Brain Stats */}
+        <View style={styles.section}>
+          <View style={styles.sectionHeader}>
+            <Ionicons name="fitness-outline" size={20} color="#00d4ff" />
+            <Text style={styles.sectionTitle}>JARVIS Brain</Text>
+          </View>
+          <View style={styles.brainCard}>
+            <View style={styles.brainStat}>
+              <Ionicons name="library-outline" size={28} color="#00d4ff" />
+              <Text style={styles.brainValue}>{trainingStats?.total_knowledge_entries || 0}</Text>
+              <Text style={styles.brainLabel}>Knowledge Entries</Text>
+            </View>
+            <View style={styles.brainStat}>
+              <Ionicons name="chatbubbles-outline" size={28} color="#4a9eff" />
+              <Text style={styles.brainValue}>{trainingStats?.total_conversations || 0}</Text>
+              <Text style={styles.brainLabel}>Conversations</Text>
+            </View>
+            <View style={styles.brainStat}>
+              <Ionicons name="trending-up-outline" size={28} color="#00ff88" />
+              <Text style={styles.brainValue}>{trainingStats?.learning_rate || 0}</Text>
+              <Text style={styles.brainLabel}>Learning Rate</Text>
+            </View>
+          </View>
+          <Text style={styles.evolutionText}>
+            JARVIS evolves with every conversation, building a comprehensive knowledge base that makes responses smarter over time.
+          </Text>
+        </View>
+
+        {/* Usage Analytics */}
         <View style={styles.section}>
           <View style={styles.sectionHeader}>
             <Ionicons name="analytics-outline" size={20} color="#00d4ff" />
@@ -482,6 +521,36 @@ const styles = StyleSheet.create({
     fontSize: 11,
     color: '#888',
     textAlign: 'center',
+  },
+  brainCard: {
+    flexDirection: 'row',
+    backgroundColor: '#0d1b2a',
+    borderRadius: 12,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: '#1a3a5c',
+    justifyContent: 'space-around',
+  },
+  brainStat: {
+    alignItems: 'center',
+    gap: 6,
+  },
+  brainValue: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: '#fff',
+  },
+  brainLabel: {
+    fontSize: 10,
+    color: '#888',
+    textAlign: 'center',
+  },
+  evolutionText: {
+    fontSize: 12,
+    color: '#666',
+    marginTop: 12,
+    textAlign: 'center',
+    fontStyle: 'italic',
   },
   emptyText: {
     color: '#666',
