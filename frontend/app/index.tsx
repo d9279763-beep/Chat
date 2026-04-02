@@ -58,8 +58,8 @@ export default function JarvisScreen() {
     };
     setMessages([greeting]);
     
-    // Play greeting with HD voice
-    playHighQualityVoice(greeting.content);
+    // Note: Don't auto-play voice on greeting - browser requires user interaction first
+    // Voice will play when user sends a message or taps a button
     
     // Setup audio
     setupAudio();
