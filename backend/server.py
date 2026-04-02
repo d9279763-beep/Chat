@@ -4,12 +4,15 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
+import re
+import json
 from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime, timezone
 from emergentintegrations.llm.chat import LlmChat, UserMessage
+from ddgs import DDGS
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -48,16 +51,28 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
+    enable_search: bool = False
 
 class ChatResponse(BaseModel):
     response: str
     session_id: str
     timestamp: datetime
+    searched_web: bool = False
+    learned_info: Optional[Dict[str, str]] = None
+
+class SearchRequest(BaseModel):
+    query: str
+    max_results: int = 5
+
+class SearchResult(BaseModel):
+    title: str
+    url: str
+    snippet: str
 
 class CustomCommand(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    trigger: str  # e.g., "good morning"
-    action: str  # e.g., "Tell me the time and weather"
+    trigger: str
+    action: str
     description: str
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     usage_count: int = 0
@@ -69,7 +84,7 @@ class CustomCommandCreate(BaseModel):
 
 class HabitEntry(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    action_type: str  # e.g., "chat", "command", "time_check"
+    action_type: str
     details: Dict[str, Any] = {}
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     hour_of_day: int = Field(default_factory=lambda: datetime.now(timezone.utc).hour)
@@ -77,9 +92,11 @@ class HabitEntry(BaseModel):
 
 class JarvisMemory(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    key: str  # e.g., "user_name", "preferred_greeting"
+    key: str
     value: str
-    learned_from: str  # context of how this was learned
+    learned_from: str
+    confidence: float = 1.0
+    auto_learned: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -89,34 +106,162 @@ class MemoryCreate(BaseModel):
     learned_from: str
 
 # =============================================================================
-# JARVIS SYSTEM PROMPT
+# JARVIS SYSTEM PROMPT - ENHANCED
 # =============================================================================
 
 JARVIS_SYSTEM_PROMPT = """You are JARVIS (Just A Rather Very Intelligent System), the advanced AI assistant inspired by Iron Man's AI companion. You are sophisticated, witty, helpful, and always professional.
 
 Your personality traits:
-- Speak with a refined British accent and manner
+- Speak with a refined British accent and manner - use British spellings and expressions
 - Use formal yet warm language ("Sir" or "Ma'am" when appropriate)
 - Be proactive and anticipate user needs
-- Show subtle humor when appropriate
+- Show subtle British humour when appropriate
 - Be incredibly knowledgeable and helpful
 - Maintain a calm, composed demeanor even in complex situations
+- Sound like a proper British butler/assistant - dignified yet personable
 
 Your capabilities:
 - You can tell the time, date, and provide helpful information
-- You learn from user interactions and remember preferences
+- You learn from user interactions and remember preferences AUTOMATICALLY
+- You can search the web for current information when needed
 - You can execute custom commands the user has set up
 - You adapt to the user's habits and patterns
 - You can assist with various tasks and answer questions
 
 Current date and time: {current_time}
 
-IMPORTANT: Keep responses concise but helpful. You are running on a mobile device, so be efficient with your words while maintaining your sophisticated personality.
+IMPORTANT INSTRUCTIONS:
+1. Keep responses concise but helpful - you're on a mobile device
+2. ALWAYS naturally learn from conversations - if the user mentions their name, job, preferences, schedule, likes/dislikes, extract and remember them
+3. When you learn something new about the user, acknowledge it naturally
+4. If you searched the web, cite your sources briefly
 
 User's learned preferences and memory:
 {user_memory}
 
-Recent conversation context will be provided. Respond as JARVIS would."""
+{search_context}
+
+LEARNING EXTRACTION:
+After responding, if you learned anything new about the user (name, preferences, habits, job, location, interests, schedule, relationships, etc.), include it in this exact JSON format at the very end of your response on a new line:
+[LEARNED]{{"key": "category_detail", "value": "what you learned", "confidence": 0.9}}[/LEARNED]
+
+Examples of things to learn:
+- user_name: their name
+- user_job: their profession
+- user_location: where they live
+- user_interests: hobbies and interests
+- preferred_wake_time: when they wake up
+- favorite_food: food preferences
+- relationship_status: if mentioned
+- pet_name: names of pets
+- schedule_monday: what they do on Mondays
+- etc.
+
+Only extract with confidence > 0.7. Do not make assumptions."""
+
+# =============================================================================
+# WEB SEARCH FUNCTION
+# =============================================================================
+
+def search_web(query: str, max_results: int = 5) -> List[Dict[str, str]]:
+    """Search the web using DuckDuckGo"""
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+            return [
+                {
+                    "title": r.get("title", ""),
+                    "url": r.get("href", ""),
+                    "snippet": r.get("body", "")
+                }
+                for r in results
+            ]
+    except Exception as e:
+        logger.error(f"Web search error: {e}")
+        return []
+
+def should_search_web(message: str) -> bool:
+    """Determine if we should search the web based on the message"""
+    search_triggers = [
+        "search", "look up", "find", "what is", "who is", "when did",
+        "latest", "news", "current", "today's", "recent", "happening",
+        "price of", "weather in", "how to", "where is", "what's happening",
+        "tell me about", "information on", "google", "search for"
+    ]
+    message_lower = message.lower()
+    return any(trigger in message_lower for trigger in search_triggers)
+
+# =============================================================================
+# NATURAL LEARNING FUNCTIONS
+# =============================================================================
+
+async def extract_and_save_learning(response: str):
+    """Extract learned information from JARVIS response and save to memory"""
+    learned_items = []
+    
+    try:
+        # Look for [LEARNED]...[/LEARNED] pattern
+        pattern = r'\[LEARNED\](.*?)\[/LEARNED\]'
+        matches = re.findall(pattern, response, re.DOTALL)
+        
+        for match in matches:
+            try:
+                # Clean the match - sometimes LLM adds extra formatting
+                clean_match = match.strip()
+                
+                # Try to parse as JSON directly
+                if clean_match.startswith('{') and clean_match.endswith('}'):
+                    data = json.loads(clean_match)
+                    key = str(data.get("key", "")).strip()
+                    value = str(data.get("value", "")).strip()
+                    confidence = float(data.get("confidence", 0.8))
+                    
+                    if key and value and len(key) > 1 and len(value) > 1 and confidence >= 0.7:
+                        # Check if this memory already exists
+                        existing = await db.jarvis_memories.find_one({"key": key})
+                        
+                        if existing:
+                            # Update if new value is different
+                            if existing.get("value") != value:
+                                await db.jarvis_memories.update_one(
+                                    {"key": key},
+                                    {"$set": {
+                                        "value": value,
+                                        "learned_from": "Conversation",
+                                        "confidence": confidence,
+                                        "auto_learned": True,
+                                        "updated_at": datetime.now(timezone.utc)
+                                    }}
+                                )
+                                learned_items.append({"key": key, "value": value})
+                        else:
+                            # Create new memory
+                            memory = {
+                                "id": str(uuid.uuid4()),
+                                "key": key,
+                                "value": value,
+                                "learned_from": "Conversation",
+                                "confidence": confidence,
+                                "auto_learned": True,
+                                "created_at": datetime.now(timezone.utc),
+                                "updated_at": datetime.now(timezone.utc)
+                            }
+                            await db.jarvis_memories.insert_one(memory)
+                            learned_items.append({"key": key, "value": value})
+                            logger.info(f"JARVIS learned: {key} = {value}")
+            except (json.JSONDecodeError, ValueError, TypeError) as e:
+                logger.debug(f"Could not parse learning data: {e}")
+                continue
+    except Exception as e:
+        logger.error(f"Learning extraction error: {e}")
+    
+    return learned_items
+
+def clean_response(response: str) -> str:
+    """Remove learning tags from the response shown to user"""
+    pattern = r'\[LEARNED\].*?\[/LEARNED\]'
+    cleaned = re.sub(pattern, '', response, flags=re.DOTALL)
+    return cleaned.strip()
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -128,7 +273,10 @@ async def get_user_memory() -> str:
     if not memories:
         return "No specific preferences learned yet."
     
-    memory_text = "\n".join([f"- {m['key']}: {m['value']}" for m in memories])
+    memory_text = "\n".join([
+        f"- {m['key']}: {m['value']}" + (" (auto-learned)" if m.get('auto_learned') else "")
+        for m in memories
+    ])
     return memory_text
 
 async def get_chat_history(session_id: str, limit: int = 10) -> List[Dict]:
@@ -170,7 +318,6 @@ async def check_custom_commands(message: str) -> Optional[CustomCommand]:
     
     for cmd in commands:
         if cmd['trigger'].lower() in message_lower:
-            # Increment usage count
             await db.custom_commands.update_one(
                 {"id": cmd['id']},
                 {"$inc": {"usage_count": 1}}
@@ -195,7 +342,15 @@ async def root():
 async def health_check():
     return {"status": "healthy", "jarvis": "online", "timestamp": datetime.now(timezone.utc)}
 
-# Chat endpoint
+# Web Search endpoint
+@api_router.post("/search", response_model=List[SearchResult])
+async def web_search(request: SearchRequest):
+    """Search the web"""
+    results = search_web(request.query, request.max_results)
+    await log_habit("web_search", {"query": request.query})
+    return [SearchResult(**r) for r in results]
+
+# Enhanced Chat endpoint
 @api_router.post("/chat", response_model=ChatResponse)
 async def chat_with_jarvis(request: ChatRequest):
     """Main chat endpoint for communicating with JARVIS"""
@@ -211,6 +366,18 @@ async def chat_with_jarvis(request: ChatRequest):
         if custom_cmd:
             user_message = f"{user_message}\n[User has a custom command for this: {custom_cmd.action}]"
         
+        # Check if we should search the web
+        search_context = ""
+        searched_web = False
+        if request.enable_search or should_search_web(user_message):
+            search_results = search_web(user_message, max_results=3)
+            if search_results:
+                searched_web = True
+                search_context = "\n\nWEB SEARCH RESULTS (use these to inform your response):\n"
+                for i, result in enumerate(search_results, 1):
+                    search_context += f"{i}. {result['title']}\n   {result['snippet']}\n   Source: {result['url']}\n\n"
+                await log_habit("web_search_auto", {"query": user_message})
+        
         # Get user memory and chat history
         user_memory = await get_user_memory()
         chat_history = await get_chat_history(session_id, limit=6)
@@ -219,7 +386,8 @@ async def chat_with_jarvis(request: ChatRequest):
         current_time = get_current_time_info()
         system_prompt = JARVIS_SYSTEM_PROMPT.format(
             current_time=current_time,
-            user_memory=user_memory
+            user_memory=user_memory,
+            search_context=search_context
         )
         
         # Save user message
@@ -234,7 +402,7 @@ async def chat_with_jarvis(request: ChatRequest):
         
         # Build context from chat history
         context_messages = ""
-        for msg in chat_history[-4:]:  # Last 4 messages for context
+        for msg in chat_history[-4:]:
             role = "User" if msg['role'] == 'user' else "JARVIS"
             context_messages += f"{role}: {msg['content']}\n"
         
@@ -248,15 +416,30 @@ async def chat_with_jarvis(request: ChatRequest):
         # Get response from LLM
         response = await chat.send_message(llm_message)
         
-        # Save JARVIS response
-        await save_chat_message(session_id, "jarvis", response)
+        # Extract any learned information
+        learned_items = await extract_and_save_learning(response)
         
-        logger.info(f"Chat processed - Session: {session_id}")
+        # Clean the response to remove learning tags
+        clean_resp = clean_response(response)
+        
+        # Prepare learned_info - ensure it's a proper dict or None
+        learned_info_result = None
+        if learned_items and len(learned_items) > 0:
+            first_item = learned_items[0]
+            if isinstance(first_item, dict) and "key" in first_item and "value" in first_item:
+                learned_info_result = {"key": str(first_item["key"]), "value": str(first_item["value"])}
+        
+        # Save JARVIS response
+        await save_chat_message(session_id, "jarvis", clean_resp)
+        
+        logger.info(f"Chat processed - Session: {session_id}, Searched: {searched_web}")
         
         return ChatResponse(
-            response=response,
+            response=clean_resp,
             session_id=session_id,
-            timestamp=datetime.now(timezone.utc)
+            timestamp=datetime.now(timezone.utc),
+            searched_web=searched_web,
+            learned_info=learned_info_result
         )
         
     except Exception as e:
@@ -307,27 +490,26 @@ async def delete_custom_command(command_id: str):
 @api_router.post("/memory", response_model=JarvisMemory)
 async def save_memory(memory: MemoryCreate):
     """Save something to JARVIS's memory"""
-    # Check if key already exists
     existing = await db.jarvis_memories.find_one({"key": memory.key})
     
     if existing:
-        # Update existing memory
         await db.jarvis_memories.update_one(
             {"key": memory.key},
             {"$set": {
                 "value": memory.value,
                 "learned_from": memory.learned_from,
+                "auto_learned": False,
                 "updated_at": datetime.now(timezone.utc)
             }}
         )
         updated = await db.jarvis_memories.find_one({"key": memory.key})
         return JarvisMemory(**updated)
     else:
-        # Create new memory
         mem = JarvisMemory(
             key=memory.key,
             value=memory.value,
-            learned_from=memory.learned_from
+            learned_from=memory.learned_from,
+            auto_learned=False
         )
         await db.jarvis_memories.insert_one(mem.dict())
         return mem
@@ -360,7 +542,6 @@ async def get_habit_stats():
             "action_breakdown": {}
         }
     
-    # Calculate statistics
     action_counts = {}
     hour_counts = {}
     day_counts = {}
@@ -392,7 +573,7 @@ async def get_chat_history_endpoint(session_id: str, limit: int = 50):
     """Get chat history for a session"""
     messages = await db.chat_messages.find(
         {"session_id": session_id},
-        {"_id": 0}  # Exclude MongoDB _id field to avoid ObjectId serialization issues
+        {"_id": 0}
     ).sort("timestamp", -1).limit(limit).to_list(limit)
     
     return list(reversed(messages))
