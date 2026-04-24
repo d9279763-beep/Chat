@@ -13,6 +13,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import uuid
+import random
 from datetime import datetime, timezone, timedelta
 from emergentintegrations.llm.chat import LlmChat, UserMessage
 from emergentintegrations.llm.openai import OpenAITextToSpeech
@@ -82,6 +83,21 @@ class SearchResult(BaseModel):
     title: str
     url: str
     snippet: str
+
+class RoleTemplate(BaseModel):
+    role: str
+    count: int = Field(default=1, ge=0)
+
+class RoleAssignmentRequest(BaseModel):
+    players: List[str] = Field(min_length=4)
+    impostor_count: int = Field(default=1, ge=1, le=3)
+    include_neutral_role: bool = False
+    extra_roles: List[RoleTemplate] = []
+
+class RoleAssignmentResponse(BaseModel):
+    seed: str
+    assignments: Dict[str, str]
+    role_counts: Dict[str, int]
 
 class CustomCommand(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -603,6 +619,54 @@ async def web_search(request: SearchRequest):
     results = search_web(request.query, request.max_results)
     await log_habit("web_search", {"query": request.query})
     return [SearchResult(**r) for r in results]
+
+@api_router.post("/social-deduction/assign-roles", response_model=RoleAssignmentResponse)
+async def assign_social_deduction_roles(request: RoleAssignmentRequest):
+    """
+    Create server-side role assignments for an Among Us-style party lobby.
+    This endpoint is for companion/host tools and does not modify the game client.
+    """
+    unique_players = [name.strip() for name in request.players if name.strip()]
+    if len(set(unique_players)) != len(unique_players):
+        raise HTTPException(status_code=400, detail="Player names must be unique")
+    if len(unique_players) < 4:
+        raise HTTPException(status_code=400, detail="At least 4 players are required")
+
+    role_pool: List[str] = []
+    role_pool.extend(["Impostor"] * request.impostor_count)
+    if request.include_neutral_role:
+        role_pool.append("Jester")
+
+    for extra in request.extra_roles:
+        role_pool.extend([extra.role] * extra.count)
+
+    if len(role_pool) > len(unique_players):
+        raise HTTPException(status_code=400, detail="Role count exceeds player count")
+
+    crewmate_count = len(unique_players) - len(role_pool)
+    role_pool.extend(["Crewmate"] * crewmate_count)
+
+    seed = str(uuid.uuid4())
+    rng = random.Random(seed)
+    shuffled_players = unique_players[:]
+    rng.shuffle(shuffled_players)
+    rng.shuffle(role_pool)
+
+    assignments = dict(zip(shuffled_players, role_pool))
+    role_counts: Dict[str, int] = {}
+    for role in assignments.values():
+        role_counts[role] = role_counts.get(role, 0) + 1
+
+    await log_habit("social_deduction_roles_generated", {
+        "players": len(unique_players),
+        "roles": role_counts
+    })
+
+    return RoleAssignmentResponse(
+        seed=seed,
+        assignments=assignments,
+        role_counts=role_counts
+    )
 
 # Enhanced Chat endpoint with Knowledge Base
 @api_router.post("/chat", response_model=ChatResponse)
