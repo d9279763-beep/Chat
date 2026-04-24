@@ -26,3 +26,25 @@ Example payload:
 ```
 
 The endpoint returns deterministic role assignments and a role breakdown so a host app can privately distribute roles to players.
+
+## PC (Steam) C++ host utility
+
+For desktop/Steam sessions, use the C++ companion tool in `tools/steam_host_helper.cpp`.
+
+Build:
+
+```bash
+g++ -std=c++17 -O2 -o steam_host_helper tools/steam_host_helper.cpp
+```
+
+Run:
+
+```bash
+./steam_host_helper \
+  --players "Alex,Blair,Casey,Drew,Emery,Flynn" \
+  --impostors 2 \
+  --jester \
+  --extra "Sheriff:1,Engineer:1"
+```
+
+This utility generates deterministic role assignments from a seed and is intended for host-side role distribution only.
